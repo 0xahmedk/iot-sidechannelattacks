@@ -44,7 +44,7 @@ def load_and_label(attack_path, benign_path, nrows):
     attack = pd.read_csv(attack_path, nrows=nrows)
     benign = pd.read_csv(benign_path, nrows=nrows)
 
-    # Add Label column: 1 for attack, 0 for benign
+    # Add Label column: 1 for attack, 0 for benign (file-level)
     attack = attack.copy()
     benign = benign.copy()
     attack['Label'] = 1
@@ -52,41 +52,173 @@ def load_and_label(attack_path, benign_path, nrows):
 
     # Concatenate and return
     df = pd.concat([attack, benign], ignore_index=True)
+
+    # If the CSVs contain a per-row `Attacks` column, derive labels from it
+    # (Label = 1 where Attacks > 0). This prevents accidental file-level
+    # mislabeling when files contain mixed rows.
+    if 'Attacks' in df.columns:
+        # coerce to numeric safely and consider >0 as attack
+        df['Label'] = (pd.to_numeric(df['Attacks'], errors='coerce') > 0).fillna(False).astype(int)
+        print("Derived per-row labels from 'Attacks' column (Label = Attacks > 0).")
+
+    # Coerce common numeric-ish columns to numeric types when possible so
+    # downstream select_dtypes can find them even if some rows are strings.
+    for c in ('Attacks', 'Power'):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+
     return df
 
 
-def preprocess(df):
-    """Drop NaNs and select numeric features only (safe for heterogeneous CSVs).
-
-    Returns X (features dataframe) and y (labels Series).
+def engineered_preprocess(df, window_size=10):
     """
-    # Drop rows with any missing values to avoid surprises during training
+    Feature Engineering & Preprocessing (engineered version).
+    Adds rolling window features (Mean, Std, Max, Min) to capture temporal patterns.
+    Then drops NaNs and selects numeric features.
+    """
+    print(f"Generating rolling features with window size: {window_size} (engineered)...")
+
+    # 1. Ensure data is sorted by Time (critical for rolling windows)
+    if 'Time' in df.columns:
+        # Coerce/parse Time to a single comparable dtype to avoid failures when
+        # the column contains mixed types (ints, floats, strings).
+        time_orig = df['Time']
+
+        # Try numeric conversion first (e.g., epoch timestamps)
+        time_num = pd.to_numeric(time_orig, errors='coerce')
+
+        # Next, try to parse datetimes by attempting a list of common formats.
+        # Specifying formats avoids pandas falling back to per-element parsing
+        # and emitting the "Could not infer format" warning.
+        common_formats = [
+            '%Y-%m-%d %H:%M:%S',
+            '%Y/%m/%d %H:%M:%S',
+            '%Y-%m-%d',
+            '%m/%d/%Y %H:%M:%S',
+            '%d-%m-%Y %H:%M:%S',
+            '%Y-%m-%dT%H:%M:%S%z',
+            '%Y-%m-%dT%H:%M:%S',
+        ]
+
+        time_dt = pd.Series(pd.NaT, index=time_orig.index)
+        for fmt in common_formats:
+            parsed = pd.to_datetime(time_orig, format=fmt, errors='coerce')
+            mask = parsed.notna() & time_dt.isna()
+            if mask.any():
+                time_dt.loc[mask] = parsed.loc[mask]
+
+        # If numeric conversion produced the most non-null values, prefer numeric.
+        if time_num.notna().sum() >= time_dt.notna().sum():
+            df['Time'] = time_num
+            n_invalid = time_num.isna().sum()
+            if n_invalid:
+                print(f"Note: {n_invalid} 'Time' values couldn't be converted to numeric and were set to NaN.")
+        else:
+            # If some values remain unparsed, we avoid calling pd.to_datetime without a
+            # format (which triggers the warning). Instead, we keep the parsed values
+            # and report how many failed — ask the user to add their specific format
+            # if many entries failed to parse.
+            df['Time'] = time_dt
+            n_parsed = time_dt.notna().sum()
+            n_total = len(time_dt)
+            n_failed = n_total - n_parsed
+            print(f"Parsed {n_parsed}/{n_total} 'Time' values using common formats; {n_failed} remain unparsed.")
+            if n_failed:
+                print("If you see many unparsed values, specify the exact Time format in the code or fix the CSV.")
+
+        # Drop rows where Time could not be parsed/coerced
+        before_time = len(df)
+        df = df.dropna(subset=['Time'])
+        after_time = len(df)
+        if before_time != after_time:
+            print(f"Dropped {before_time - after_time} rows with invalid 'Time' values.")
+
+        # Now safe to sort by Time
+        df = df.sort_values('Time')
+
+    # 2. Create Temporal Features on the 'Power' column
+    # This adds 'Memory' to your model: it sees the trend, not just the current value.
+    if 'Power' in df.columns:
+        # Ensure Power is numeric
+        df['Power'] = pd.to_numeric(df['Power'], errors='coerce')
+
+        # Calculate statistics over the last N rows
+        df['Power_Mean'] = df['Power'].rolling(window=window_size).mean()
+        df['Power_Std']  = df['Power'].rolling(window=window_size).std() # Captures volatility/jitter
+        df['Power_Max']  = df['Power'].rolling(window=window_size).max() # Captures peaks
+        df['Power_Min']  = df['Power'].rolling(window=window_size).min()
+    else:
+        print("WARNING: 'Power' column not found. Skipping rolling features.")
+
+    # 3. Drop NaNs 
+    # This will now remove the original NaNs AND the first 'window_size' rows 
+    # which result in NaN during rolling calculations.
     before = len(df)
     df = df.dropna()
     after = len(df)
-    print(f"Dropped {before - after} rows containing NaNs. {after} rows remain.")
+    print(f"Dropped {before - after} rows (NaNs + rolling warmup). {after} rows remain.")
 
     if 'Label' not in df.columns:
         raise ValueError("DataFrame must contain a 'Label' column")
 
-    # Keep only numeric columns (this automatically excludes strings like timestamps)
-    numeric = df.select_dtypes(include=[np.number])
+    # 4. Select Numeric Columns
+    numeric = df.select_dtypes(include=[np.number]).copy()
 
-    if 'Label' not in numeric.columns:
-        # If Label was not numeric for some reason, coerce it
-        numeric['Label'] = df['Label'].astype(int)
+    # Safety check for Label
+    if 'Label' not in numeric.columns and 'Label' in df.columns:
+        numeric['Label'] = pd.to_numeric(df['Label'], errors='coerce').fillna(0).astype(int)
 
-    # Separate features and label
+    # Remove 'Attacks' to avoid leakage (Label is already derived from it)
+    if 'Attacks' in numeric.columns:
+        numeric = numeric.drop(columns=['Attacks'])
+
+    # 5. Split Features (X) and Target (y)
     X = numeric.drop(columns=['Label'])
     y = numeric['Label'].astype(int)
 
     if X.shape[1] == 0:
         raise ValueError("No numeric feature columns found. Check your CSV files.")
 
-    print(f"Using {X.shape[0]} rows and {X.shape[1]} numeric features for training.")
+    print(f"Using {X.shape[0]} rows and {X.shape[1]} numeric features: {list(X.columns)}")
     return X, y
 
 
+def simple_preprocess(df):
+    """
+    Simple preprocessing: drop NaNs and use only existing numeric columns (no temporal features).
+    This is the baseline to compare against the engineered version.
+    """
+    print("Using simple features (no temporal/rolling engineering)...")
+
+    df = df.copy()
+    # Coerce commonly numeric-ish columns
+    for c in ('Attacks', 'Power'):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+
+    before = len(df)
+    df = df.dropna()
+    after = len(df)
+    print(f"Dropped {before - after} rows due to NaNs. {after} rows remain.")
+
+    if 'Label' not in df.columns:
+        raise ValueError("DataFrame must contain a 'Label' column")
+
+    numeric = df.select_dtypes(include=[np.number]).copy()
+    if 'Label' not in numeric.columns and 'Label' in df.columns:
+        numeric['Label'] = pd.to_numeric(df['Label'], errors='coerce').fillna(0).astype(int)
+
+    if 'Attacks' in numeric.columns:
+        numeric = numeric.drop(columns=['Attacks'])
+
+    X = numeric.drop(columns=['Label'])
+    y = numeric['Label'].astype(int)
+
+    if X.shape[1] == 0:
+        raise ValueError("No numeric feature columns found. Check your CSV files.")
+
+    print(f"Using {X.shape[0]} rows and {X.shape[1]} numeric features: {list(X.columns)}")
+    return X, y
 def train_and_evaluate(X, y, n_estimators=50):
     """Split data, train RandomForest, and print evaluation metrics."""
     # Use stratified split if both classes are present
@@ -126,7 +258,13 @@ def train_and_evaluate(X, y, n_estimators=50):
     for i, row_label in enumerate(labels):
         row = "\t".join(str(x) for x in cm[i])
         print(f"{row_label}\t{row}")
-
+    # Return a small summary for programmatic comparison
+    return {
+        'accuracy': acc,
+        'n_train': len(X_train),
+        'n_test': len(X_test),
+        'n_features': X.shape[1],
+    }
 
 def main():
     parser = argparse.ArgumentParser(
@@ -136,9 +274,13 @@ def main():
     parser.add_argument('--benign', type=str, default='benign_data.csv', help='Path to benign CSV')
     parser.add_argument('--nrows', type=int, default=20000, help='Number of rows to read from each CSV')
     parser.add_argument('--n_estimators', type=int, default=50, help='Number of trees for RandomForest')
+    parser.add_argument('--feature-mode', type=str, default='engineered',
+                        choices=['simple', 'engineered', 'both'],
+                        help="Which feature set to use: simple (baseline), engineered (with rolling features), or both")
 
     args = parser.parse_args()
 
+    # 1. Load Data
     try:
         df = load_and_label(args.attack, args.benign, args.nrows)
     except FileNotFoundError as e:
@@ -148,14 +290,48 @@ def main():
         print("One of the CSV files is empty or invalid.")
         sys.exit(1)
 
+    # 2. Preprocess according to requested feature mode
+    mode = args.feature_mode
+    results = {}
+
+    def _run_mode(which):
+        if which == 'simple':
+            return simple_preprocess(df)
+        return engineered_preprocess(df)
+
     try:
-        X, y = preprocess(df)
+        if mode in ('simple', 'engineered'):
+            X, y = _run_mode(mode)
+            # Save per-mode processed file (helpful when debugging)
+            out = f"processed_data_with_features_{mode}.csv"
+            debug_df = X.copy()
+            debug_df['Label'] = y
+            debug_df.to_csv(out, index=False)
+            print(f"[DEBUG] Saved processed data to '{out}'")
+
+            metrics = train_and_evaluate(X, y, n_estimators=args.n_estimators)
+            results[mode] = metrics
+        else:  # both
+            for which in ('simple', 'engineered'):
+                X, y = _run_mode(which)
+                out = f"processed_data_with_features_{which}.csv"
+                debug_df = X.copy()
+                debug_df['Label'] = y
+                debug_df.to_csv(out, index=False)
+                print(f"[DEBUG] Saved processed data to '{out}'")
+
+                metrics = train_and_evaluate(X, y, n_estimators=args.n_estimators)
+                results[which] = metrics
+
     except ValueError as e:
         print(f"Preprocessing error: {e}")
         sys.exit(1)
 
-    train_and_evaluate(X, y, n_estimators=args.n_estimators)
-
+    # 3. If both modes were run, print a concise comparison
+    if args.feature_mode == 'both':
+        print('\nComparison of feature modes:')
+        for m, stats in results.items():
+            print(f"- {m}: acc={stats['accuracy']:.4f}, train={stats['n_train']}, test={stats['n_test']}, features={stats['n_features']}")
 
 if __name__ == '__main__':
     main()
